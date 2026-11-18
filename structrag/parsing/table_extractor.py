@@ -322,11 +322,14 @@ def extract_tables(
 if __name__ == "__main__":
     import io
     import sys
-    # Force UTF-8 output
     if hasattr(sys.stdout, "buffer"):
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
-    pdf_path = PROJECT_ROOT / "FA039724-NF EN 1992-1-1 (octobre 2005) Eurocode 2.pdf"
+    pdf_candidates = list(PROJECT_ROOT.glob("*.pdf"))
+    if not pdf_candidates:
+        print(f"ERROR: No PDF found in {PROJECT_ROOT}")
+        sys.exit(1)
+    pdf_path = pdf_candidates[0]
     print(f"Extracting tables from: {pdf_path.name}\n")
 
     nodes = extract_tables(str(pdf_path))

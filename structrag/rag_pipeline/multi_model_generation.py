@@ -32,20 +32,16 @@ from typing import Optional
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# Auto-load .env
-try:
-    from dotenv import load_dotenv
-    load_dotenv(PROJECT_ROOT / ".env")
-except ImportError:
-    for line in (PROJECT_ROOT / ".env").read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ[k.strip()] = v.strip()
-
+# Config loads .env automatically
+from structrag.config import (  # noqa: E402
+    DEFAULT_GROQ_MODEL,
+    DEFAULT_GEMINI_MODEL,
+    DEFAULT_NVIDIA_MODEL,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_TEMPERATURE,
+)
 from structrag.rag_pipeline.generation import (
     GenerationResult, build_prompt, SYSTEM_PROMPT,
-    DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE,
 )
 
 # ---------------------------------------------------------------------------

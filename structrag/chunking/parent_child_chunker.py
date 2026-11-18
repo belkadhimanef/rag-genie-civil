@@ -1,73 +1,46 @@
 """
 structrag/chunking/parent_child_chunker.py
-------------------------------------------
+-------------------------------------------
 Parent-child (small-to-big) chunking strategy.
 
 Architecture
 ------------
-Standard RAG retrieval has a precision-recall tension:
-  - Small chunks  → precise embedding, but missing surrounding context
-  - Large chunks  → rich context, but embedding is diluted by irrelevant text
+Standard RAG has a precision-recall tension:
+  - Small chunks  → precise embedding match, but missing surrounding context
+  - Large chunks  → rich generation context, but diluted embedding signal
 
-The parent-child pattern resolves this by maintaining TWO representations:
-  - CHILD chunks  : small, focused, embeddable (one paragraph or one table row)
-                    These are what gets indexed in ChromaDB for retrieval.
-  - PARENT chunks : the full clause or section that contains those children
-                    These are NOT indexed for retrieval — they are looked up
-                    by ID after retrieval to form the generation context.
+The parent-child pattern resolves this by keeping two representations:
+
+  CHILD chunks  — small, focused, embeddable (one paragraph or one table row)
+                  These are indexed in ChromaDB for retrieval.
+
+  PARENT chunks — the full clause containing those children, with heading and
+                  all sibling paragraphs assembled.
+                  These are NOT indexed for retrieval.  They are looked up by
+                  parent_chunk_id after retrieval to form the generation context.
 
 Query flow
 ----------
-1. Embed user query.
-2. Retrieve top-k CHILD chunks by cosine similarity (+ BM25).
-3. For each child, look up its PARENT chunk by parent_chunk_id.
-4. De-duplicate parents (multiple children may share one parent).
-5. Pass the PARENT texts to the LLM — full clause context, not fragments.
+1. Embed query → retrieve top-k CHILD chunks by cosine similarity + BM25.
+2. For each child, look up its parent chunk by parent_chunk_id.
+3. De-duplicate parents (multiple children may share one parent).
+4. Pass PARENT texts to the LLM — full clause context, not fragments.
 
-Why this fixes failures
------------------------
-Q6 (εcu2 strain): the child chunk "εcu2 (‰) | 3,5" embeds well for the
-specific value query; the parent gives the full Table 3.1 with all parameters.
-
-Q8 (characteristic vs design values): a child paragraph from clause 3.1.1
-embeds well for "characteristic value fck"; the parent gives the surrounding
-explanation including the design value relationship.
+Table row splitting
+-------------------
+Markdown tables from table_extractor.py are split into individual row-level
+child chunks, each carrying the caption + header rows so the row is
+self-contained.  The full table is the parent.
 
 Output
 ------
-Two JSON files:
-  data/chunks/ec2_child_chunks.json   — small chunks for embedding/retrieval
-  data/chunks/ec2_parent_chunks.json  — full-clause chunks for generation
-
-Each CHILD chunk dict:
-    chunk_id        str
-    source_id       str
-    chunk_type      "child"
-    parent_chunk_id str   — ID of the parent chunk to look up at generation time
-    clause_number   str
-    level           int
-    ancestor_path   str
-    page_number     int
-    text            str   — small focused text (one paragraph / table row)
-    token_count     int
-    child_type      str   — "paragraph" | "note" | "table_row" | "table"
-    paragraph_tag   str   — "(1)P", "(2)", etc. if applicable
-
-Each PARENT chunk dict:
-    chunk_id        str
-    source_id       str
-    chunk_type      "parent"
-    clause_number   str
-    level           int
-    ancestor_path   str
-    page_number     int
-    text            str   — full clause text (heading + all children)
-    token_count     int
-    cross_refs      list
-    child_ids       list  — IDs of child chunks that point to this parent
+Two JSON files in data/chunks/:
+  ec2_child_chunks.json   — small chunks for embedding / retrieval
+  ec2_parent_chunks.json  — full-clause chunks for LLM generation context
 """
 
 from __future__ import annotations
+
 import json
 import re
 import sys
@@ -77,6 +50,12 @@ from typing import Optional
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from structrag.config import (
+    CHILD_CHUNKS_PATH,
+    CHILD_MAX_TOKENS,
+    PARENT_CHUNKS_PATH,
+    PARENT_MAX_TOKENS,
+)
 from structrag.parsing.hierarchy_schema import Node, load_nodes
 
 # ---------------------------------------------------------------------------
@@ -85,21 +64,26 @@ from structrag.parsing.hierarchy_schema import Node, load_nodes
 try:
     import tiktoken
     _enc = tiktoken.get_encoding("cl100k_base")
+
     def count_tokens(text: str) -> int:
         return len(_enc.encode(text))
+
 except ImportError:
-    def count_tokens(text: str) -> int:
+    def count_tokens(text: str) -> int:  # type: ignore[misc]
         return int(len(text.split()) / 0.75)
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-PARENT_MAX_TOKENS = 1500   # max tokens in a parent chunk
-CHILD_MAX_TOKENS  = 200    # max tokens in a single child chunk
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _build_children_index(nodes: list[Node]) -> dict[str, list[Node]]:
+    idx: dict[str, list[Node]] = {}
+    for node in nodes:
+        pid = node.parent_id or "__root__"
+        idx.setdefault(pid, []).append(node)
+    return idx
+
 
 def _heading_block(node: Node) -> str:
     num   = node.clause_number or ""
@@ -111,21 +95,12 @@ def _heading_block(node: Node) -> str:
 def _child_text(child: Node) -> str:
     tag = child.metadata.get("paragraph_tag", "") if child.metadata else ""
     if child.type == "paragraph":
-        prefix = f"{tag}  " if tag else ""
-        return f"{prefix}{child.text}".strip()
-    elif child.type == "note":
+        return f"{tag}  {child.text}".strip() if tag else child.text.strip()
+    if child.type == "note":
         return f"NOTE  {child.text}".strip() if child.text else ""
-    elif child.type in ("table", "image"):
+    if child.type in ("table", "image"):
         return f"[TABLE/FIGURE — page {child.page_number}]"
     return child.text.strip() if child.text else ""
-
-
-def _build_children_index(nodes: list[Node]) -> dict[str, list[Node]]:
-    idx: dict[str, list[Node]] = {}
-    for node in nodes:
-        pid = node.parent_id or "__root__"
-        idx.setdefault(pid, []).append(node)
-    return idx
 
 
 def _extract_cross_refs(text: str) -> list[str]:
@@ -133,20 +108,12 @@ def _extract_cross_refs(text: str) -> list[str]:
     return list(dict.fromkeys(refs))
 
 
-# ---------------------------------------------------------------------------
-# Split a long parent into multiple parents at paragraph boundaries
-# ---------------------------------------------------------------------------
-
 def _split_parent_text(
     heading_block: str,
     child_texts: list[str],
-    max_tokens: int,
+    max_tokens: int = PARENT_MAX_TOKENS,
 ) -> list[str]:
-    """
-    If heading + all children exceeds max_tokens, split into multiple parent
-    texts, each starting with the heading_block for context continuity.
-    Returns a list of text strings (usually one, occasionally more).
-    """
+    """Split a long clause into multiple parent texts at paragraph boundaries."""
     parts: list[str] = []
     current: list[str] = []
     current_tokens = count_tokens(heading_block)
@@ -167,38 +134,28 @@ def _split_parent_text(
     return parts
 
 
-# ---------------------------------------------------------------------------
-# Table row splitting — each row of a table becomes its own child chunk
-# ---------------------------------------------------------------------------
-
 def _split_table_rows(table_text: str, ancestor_path: str) -> list[str]:
     """
-    Split a markdown table into individual row strings, each self-contained
-    with the caption and header row repeated.
-    Returns a list of row-level strings.
+    Split a markdown table into individual row strings, each carrying the
+    caption and header row so the row is self-contained for embedding.
     """
     lines = table_text.strip().split("\n")
     if not lines:
         return [table_text]
 
-    # Find the caption (first line), header row and separator
-    caption_lines = []
-    header_row    = None
-    sep_row       = None
-    data_rows     = []
+    caption_lines: list[str] = []
+    header_row: Optional[str] = None
+    sep_row:    Optional[str] = None
+    data_rows:  list[str] = []
 
     i = 0
-    # Caption lines: everything before the first | row
     while i < len(lines) and not lines[i].strip().startswith("|"):
         caption_lines.append(lines[i])
         i += 1
-    # Header row
     if i < len(lines):
         header_row = lines[i]; i += 1
-    # Separator row
-    if i < len(lines) and set(lines[i].replace("|","").replace("-","").replace(" ","")) == set():
+    if i < len(lines) and not set(lines[i].replace("|", "").replace("-", "").strip()):
         sep_row = lines[i]; i += 1
-    # Data rows
     while i < len(lines):
         if lines[i].strip():
             data_rows.append(lines[i])
@@ -210,12 +167,10 @@ def _split_table_rows(table_text: str, ancestor_path: str) -> list[str]:
     caption_str = "\n".join(caption_lines)
     header_str  = f"{header_row}\n{sep_row}" if sep_row else header_row
 
-    row_chunks = []
-    for row in data_rows:
-        row_text = f"{caption_str}\n{header_str}\n{row}".strip()
-        row_chunks.append(row_text)
-
-    return row_chunks if row_chunks else [table_text]
+    return [
+        f"{caption_str}\n{header_str}\n{row}".strip()
+        for row in data_rows
+    ] or [table_text]
 
 
 # ---------------------------------------------------------------------------
@@ -229,9 +184,11 @@ def chunk_parent_child(
     """
     Build parent and child chunk lists from a parsed node list.
 
-    Returns (child_chunks, parent_chunks).
+    Returns
+    -------
+    (child_chunks, parent_chunks)
     """
-    children_idx = _build_children_index(nodes)
+    children_idx  = _build_children_index(nodes)
     heading_types = {"section", "clause", "subclause"}
 
     parent_chunks: list[dict] = []
@@ -248,13 +205,13 @@ def chunk_parent_child(
         ]
 
         if not text_children:
-            continue   # pure structural container, skip
+            continue
 
-        heading_block = _heading_block(node)
-        child_texts   = [_child_text(c) for c in text_children]
+        heading_blk = _heading_block(node)
+        child_texts = [_child_text(c) for c in text_children]
 
         # ── Build PARENT chunks ──────────────────────────────────────────
-        parent_parts = _split_parent_text(heading_block, child_texts, PARENT_MAX_TOKENS)
+        parent_parts = _split_parent_text(heading_blk, child_texts)
         parent_ids: list[str] = []
 
         for part_idx, part_text in enumerate(parent_parts):
@@ -271,40 +228,36 @@ def chunk_parent_child(
                 "text":          part_text,
                 "token_count":   count_tokens(part_text),
                 "cross_refs":    list(dict.fromkeys(all_refs)),
-                "child_ids":     [],   # filled in below
+                "child_ids":     [],
                 "part_index":    part_idx,
             })
             parent_ids.append(pid)
 
-        # Map each child paragraph to the correct parent part
-        # (simple heuristic: children are distributed round-robin across parts
-        #  but since most clauses fit in one parent, this is usually trivial)
+        # Map each child to the correct parent part
         children_per_part = max(1, len(text_children) // len(parent_parts))
 
         for child_idx, (child_node, child_text) in enumerate(
             zip(text_children, child_texts)
         ):
-            # Which parent part does this child belong to?
             part_idx_for_child = min(
                 child_idx // children_per_part,
-                len(parent_ids) - 1
+                len(parent_ids) - 1,
             )
             parent_id = parent_ids[part_idx_for_child]
 
-            # Update parent's child_ids list
             for p in parent_chunks:
                 if p["chunk_id"] == parent_id:
                     p["child_ids"].append(f"{child_node.id}_child")
                     break
 
             # ── Build CHILD chunks ────────────────────────────────────────
-            child_type = child_node.type  # paragraph / note / table / image
+            child_type = child_node.type
 
-            # For tables: split into row-level children
-            if child_type in ("table",) and "|\n|" in child_text:
+            if child_type == "table" and "|\n|" in child_text:
                 row_texts = _split_table_rows(child_text, node.ancestor_path)
                 for row_idx, row_text in enumerate(row_texts):
                     cid = f"{child_node.id}_child_row{row_idx}"
+                    full_text = f"[{node.ancestor_path}]\n{row_text}"
                     child_chunks.append({
                         "chunk_id":        cid,
                         "source_id":       source_id,
@@ -314,8 +267,8 @@ def chunk_parent_child(
                         "level":           node.level,
                         "ancestor_path":   node.ancestor_path,
                         "page_number":     child_node.page_number,
-                        "text":            f"[{node.ancestor_path}]\n{row_text}",
-                        "token_count":     count_tokens(row_text),
+                        "text":            full_text,
+                        "token_count":     count_tokens(full_text),
                         "child_type":      "table_row",
                         "paragraph_tag":   "",
                     })
@@ -323,7 +276,6 @@ def chunk_parent_child(
                 cid = f"{child_node.id}_child"
                 tag = child_node.metadata.get("paragraph_tag", "") \
                       if child_node.metadata else ""
-                # Prepend ancestor path so embedding captures document location
                 full_text = f"[{node.ancestor_path}]\n{child_text}"
                 child_chunks.append({
                     "chunk_id":        cid,
@@ -344,76 +296,8 @@ def chunk_parent_child(
 
 
 # ---------------------------------------------------------------------------
-# Save / load
+# Table node injection
 # ---------------------------------------------------------------------------
-
-def save_chunks(chunks: list[dict], path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(chunks, f, ensure_ascii=False, indent=2)
-    print(f"Saved {len(chunks)} chunks -> {path}")
-
-
-def load_chunks(path: str) -> list[dict]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-# ---------------------------------------------------------------------------
-# Parent lookup helper (used at generation time)
-# ---------------------------------------------------------------------------
-
-_parent_cache: Optional[dict[str, dict]] = None
-_parent_cache_path: Optional[str] = None
-
-
-def get_parent_lookup(parents_path: str) -> dict[str, dict]:
-    """Return a {chunk_id: parent_chunk} dict, cached in memory."""
-    global _parent_cache, _parent_cache_path
-    if _parent_cache is None or _parent_cache_path != parents_path:
-        parents = load_chunks(parents_path)
-        _parent_cache = {p["chunk_id"]: p for p in parents}
-        _parent_cache_path = parents_path
-    return _parent_cache
-
-
-def resolve_parents(
-    child_results: list[dict],
-    parents_path: str,
-) -> list[dict]:
-    """
-    Given a list of child chunk retrieval results, look up and return the
-    corresponding parent chunks (de-duplicated).
-
-    Parameters
-    ----------
-    child_results : results from retrieve_child()
-    parents_path  : path to ec2_parent_chunks.json
-
-    Returns
-    -------
-    List of parent chunk dicts, ordered by best child score, de-duplicated.
-    """
-    parent_lookup = get_parent_lookup(parents_path)
-    seen_parents: set[str] = set()
-    resolved: list[dict] = []
-
-    for child in child_results:
-        pid = child.get("parent_chunk_id", "")
-        if pid and pid not in seen_parents:
-            parent = parent_lookup.get(pid)
-            if parent:
-                # Carry the child's retrieval score to the parent for ranking
-                parent_copy = dict(parent)
-                parent_copy["score"] = child.get("score", 0)
-                parent_copy["retrieved_via_child"] = child["chunk_id"]
-                resolved.append(parent_copy)
-                seen_parents.add(pid)
-
-    return resolved
-
-
-from structrag.parsing.table_extractor import extract_tables, TABLE_SPECS
-
 
 def _add_table_nodes_to_parent_child(
     pdf_path: str,
@@ -422,12 +306,12 @@ def _add_table_nodes_to_parent_child(
     parent_chunks: list[dict],
 ) -> tuple[list[dict], list[dict]]:
     """
-    After building parent-child chunks from the parsed node tree,
-    also inject the pdfplumber-extracted table nodes.
-    Each table becomes ONE parent chunk and multiple row-level child chunks.
+    Inject pdfplumber-extracted table nodes into parent-child chunk lists.
+    Each table becomes one parent chunk and multiple row-level child chunks.
     """
+    from structrag.parsing.table_extractor import extract_tables
+
     table_nodes = extract_tables(pdf_path, source_id)
-    parent_ids  = {p["chunk_id"] for p in parent_chunks}
 
     for tnode in table_nodes:
         table_text = tnode.text
@@ -435,7 +319,6 @@ def _add_table_nodes_to_parent_child(
         clause     = tnode.clause_number or ""
         path       = tnode.ancestor_path
 
-        # Parent = full table text
         parent_id = f"{tid}_parent"
         parent_chunks.append({
             "chunk_id":      parent_id,
@@ -453,7 +336,6 @@ def _add_table_nodes_to_parent_child(
             "metadata":      tnode.metadata,
         })
 
-        # Children = individual table rows
         row_texts = _split_table_rows(table_text, path)
         for row_idx, row_text in enumerate(row_texts):
             cid = f"{tid}_child_row{row_idx}"
@@ -472,10 +354,78 @@ def _add_table_nodes_to_parent_child(
                 "child_type":      "table_row",
                 "paragraph_tag":   "",
             })
-            # Add child to parent's child_ids
             parent_chunks[-1]["child_ids"].append(cid)
 
     return child_chunks, parent_chunks
+
+
+# ---------------------------------------------------------------------------
+# Save / load helpers
+# ---------------------------------------------------------------------------
+
+def save_chunks(chunks: list[dict], path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(chunks, f, ensure_ascii=False, indent=2)
+    print(f"Saved {len(chunks)} chunks -> {path}")
+
+
+def load_chunks(path: str) -> list[dict]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Parent lookup (used at generation time)
+# ---------------------------------------------------------------------------
+
+_parent_cache: Optional[dict[str, dict]] = None
+_parent_cache_path: Optional[str] = None
+
+
+def get_parent_lookup(parents_path: str) -> dict[str, dict]:
+    """Return a {chunk_id: parent_chunk} dict, cached in module memory."""
+    global _parent_cache, _parent_cache_path
+    if _parent_cache is None or _parent_cache_path != parents_path:
+        parents = load_chunks(parents_path)
+        _parent_cache = {p["chunk_id"]: p for p in parents}
+        _parent_cache_path = parents_path
+    return _parent_cache
+
+
+def resolve_parents(
+    child_results: list[dict],
+    parents_path: str,
+) -> list[dict]:
+    """
+    Given child chunk retrieval results, return the corresponding parent
+    chunks (de-duplicated, ordered by best child score).
+
+    Parameters
+    ----------
+    child_results : results from retrieve_child()
+    parents_path  : path to ec2_parent_chunks.json
+
+    Returns
+    -------
+    List of parent chunk dicts with an added 'score' field.
+    """
+    parent_lookup = get_parent_lookup(parents_path)
+    seen: set[str] = set()
+    resolved: list[dict] = []
+
+    for child in child_results:
+        pid = child.get("parent_chunk_id", "")
+        if pid and pid not in seen:
+            parent = parent_lookup.get(pid)
+            if parent:
+                parent_copy = dict(parent)
+                parent_copy["score"] = child.get("score", 0)
+                parent_copy["retrieved_via_child"] = child["chunk_id"]
+                resolved.append(parent_copy)
+                seen.add(pid)
+
+    return resolved
+
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -486,50 +436,46 @@ if __name__ == "__main__":
     if hasattr(sys.stdout, "buffer"):
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
-    base        = Path(r"C:\Users\manef\OneDrive\Desktop\stageesprit")
-    nodes_path  = base / "structrag" / "data" / "parsed"  / "ec2_2004_nf_nodes.json"
-    pdf_path    = base / "FA039724-NF EN 1992-1-1 (octobre 2005) Eurocode 2.pdf"
-    output_dir  = base / "structrag" / "data" / "chunks"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    from collections import Counter
 
-    print(f"Loading nodes...")
-    nodes = load_nodes(str(nodes_path))
+    from structrag.config import NODES_PATH
+
+    pdf_candidates = list(PROJECT_ROOT.glob("*.pdf"))
+    if not pdf_candidates:
+        print("ERROR: No PDF found in project root.")
+        sys.exit(1)
+    pdf_path = pdf_candidates[0]
+
+    if not NODES_PATH.exists():
+        print(f"ERROR: {NODES_PATH} not found. Run run_pipeline.py --from 1 first.")
+        sys.exit(1)
+
+    print("Loading nodes ...")
+    nodes = load_nodes(str(NODES_PATH))
     print(f"Loaded {len(nodes)} nodes")
 
-    print("Building parent-child chunks from node tree...")
+    print("Building parent-child chunks ...")
     child_chunks, parent_chunks = chunk_parent_child(nodes, source_id="ec2_2004_nf")
 
-    print("Adding table nodes as parent-child chunks...")
+    print("Injecting table nodes ...")
     child_chunks, parent_chunks = _add_table_nodes_to_parent_child(
         str(pdf_path), "ec2_2004_nf", child_chunks, parent_chunks
     )
 
-    from collections import Counter
     child_types   = Counter(c["child_type"] for c in child_chunks)
     parent_tokens = [p["token_count"] for p in parent_chunks]
     child_tokens  = [c["token_count"]  for c in child_chunks]
 
     print(f"\nParent chunks : {len(parent_chunks)}")
-    print(f"  tokens — min:{min(parent_tokens)}  avg:{sum(parent_tokens)//len(parent_tokens)}  max:{max(parent_tokens)}")
-
+    print(f"  tokens — min:{min(parent_tokens)}  "
+          f"avg:{sum(parent_tokens)//len(parent_tokens)}  "
+          f"max:{max(parent_tokens)}")
     print(f"\nChild  chunks : {len(child_chunks)}")
-    print(f"  tokens — min:{min(child_tokens)}  avg:{sum(child_tokens)//len(child_tokens)}  max:{max(child_tokens)}")
+    print(f"  tokens — min:{min(child_tokens)}  "
+          f"avg:{sum(child_tokens)//len(child_tokens)}  "
+          f"max:{max(child_tokens)}")
     print(f"  by type: {dict(child_types)}")
 
-    print("\n--- Sample: clause 2.4.2.4 (gamma_c / gamma_s) ---")
-    for p in parent_chunks:
-        if p["clause_number"] == "2.4.2.4" and "_table_" not in p["chunk_id"]:
-            print(f"  PARENT: {p['chunk_id']}  tokens={p['token_count']}")
-            print(f"  text preview: {p['text'][:300]}")
-            break
-
-    print("\n--- Sample: Table 4.4N row children ---")
-    table_rows = [c for c in child_chunks
-                  if c["child_type"] == "table_row" and "4_4N" in c["chunk_id"]]
-    for r in table_rows[:4]:
-        print(f"  {r['chunk_id']}  tokens={r['token_count']}")
-        print(f"  text: {r['text'][:200]}")
-
-    save_chunks(child_chunks,  str(output_dir / "ec2_child_chunks.json"))
-    save_chunks(parent_chunks, str(output_dir / "ec2_parent_chunks.json"))
+    save_chunks(child_chunks,  str(CHILD_CHUNKS_PATH))
+    save_chunks(parent_chunks, str(PARENT_CHUNKS_PATH))
     print("\nDone.")

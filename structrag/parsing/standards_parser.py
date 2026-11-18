@@ -520,15 +520,16 @@ def extract_cross_refs(nodes: list[Node]) -> list[Node]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Resolve paths relative to project root
-    pdf_path = PROJECT_ROOT / "FA039724-NF EN 1992-1-1 (octobre 2005) Eurocode 2.pdf"
+    # Resolve PDF path: look in project root for any *.pdf
+    pdf_candidates = list(PROJECT_ROOT.glob("*.pdf"))
+    if not pdf_candidates:
+        print(f"ERROR: No PDF found in {PROJECT_ROOT}")
+        sys.exit(1)
+    pdf_path = pdf_candidates[0]
+
     output_dir = PROJECT_ROOT / "structrag" / "data" / "parsed"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "ec2_2004_nf_nodes.json"
-
-    if not pdf_path.exists():
-        print(f"ERROR: PDF not found at {pdf_path}")
-        sys.exit(1)
 
     print(f"Parsing: {pdf_path.name}")
     print(f"Skipping first {EC2_CONFIG['skip_pages_before']} pages (cover + TOC)")

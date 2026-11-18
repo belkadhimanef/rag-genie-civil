@@ -85,6 +85,8 @@ Valeurs Tableau 3.1 (exemples):
 """,
 
     "3.1.6": """
+Clause 3.1.6 — Résistance de calcul en compression et en traction
+
 Résistance de calcul en compression (Eq. 3.15):
   fcd = αcc × fck / γc
 
@@ -92,15 +94,13 @@ Résistance de calcul en traction (Eq. 3.16):
   fctd = αct × fctk,0,05 / γc
 
 où:
-  fck    = résistance caractéristique en compression du béton (MPa)
+  fck       = résistance caractéristique en compression du béton (MPa)
   fctk,0,05 = fractile 5% de la résistance en traction (MPa)
-  γc     = coefficient partiel du béton (= 1,5 situation durable/transitoire)
-  αcc    = coefficient effets à long terme compression (valeur recommandée = 1,0)
-  αct    = coefficient effets à long terme traction (valeur recommandée = 1,0)
-""",
+  γc        = coefficient partiel du béton (= 1,5 situation durable/transitoire)
+  αcc       = coefficient effets à long terme compression (valeur recommandée = 1,0)
+  αct       = coefficient effets à long terme traction (valeur recommandée = 1,0)
 
-    "3.1.6": """
-Clause 3.1.6 — Résistance de calcul en compression et en traction (Eq. 3.17, 3.18)
+Diagramme parabole-rectangle (Eq. 3.17, 3.18):
 
 Pour 0 ≤ εc ≤ εc2 (branche parabolique):
   σc = fcd × [1 - (1 - εc/εc2)^n]

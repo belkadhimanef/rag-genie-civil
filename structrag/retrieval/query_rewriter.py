@@ -29,10 +29,7 @@ from __future__ import annotations
 import re, os
 from typing import Optional
 
-from structrag.retrieval.symbol_dictionary import SYMBOLS, extract_symbols
-
-
-# ---------------------------------------------------------------------------
+from structrag.retrieval.symbol_dictionary import SYMBOLS, extract_symbols# ---------------------------------------------------------------------------
 # EC2 technical vocabulary for query expansion (no API call needed)
 # ---------------------------------------------------------------------------
 

@@ -27,6 +27,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from structrag.config import DEFAULT_N_RESULTS, EC2_SOURCE_ID  # noqa: E402
 from structrag.retrieval.retriever import retrieve_hierarchical, retrieve_flat
 from structrag.rag_pipeline.generation import generate, GenerationResult
 from structrag.rag_pipeline.groq_generation import groq_generate
@@ -34,9 +35,8 @@ from structrag.rag_pipeline.groq_generation import groq_generate
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-N_RESULTS  = 5      # chunks retrieved per query
-SOURCE_ID  = "ec2_2004_nf"
-DIVIDER    = "-" * 70
+N_RESULTS  = DEFAULT_N_RESULTS
+SOURCE_ID  = EC2_SOURCE_ID
 
 
 # ---------------------------------------------------------------------------

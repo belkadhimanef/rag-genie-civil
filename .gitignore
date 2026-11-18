@@ -1,42 +1,55 @@
-# Secrets — never commit
+# ── Secrets ───────────────────────────────────────────────────────────────
 .env
 
-# Python
+# ── Python ────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.whl
+MANIFEST
 
-# ChromaDB local database (local only — too large for git)
-structrag/data/chroma_db/
+# ── Virtual environments ───────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.env/
 
-# Raw documents (licensing restrictions)
+# ── IDE / OS ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Source documents ──────────────────────────────────────────────────────
+# Do NOT commit copyrighted engineering standards or personal documents.
+*.pdf
 structrag/data/raw_standards/
 structrag/data/raw_textbooks/
-*.pdf
 
-# Large parsed/chunk data files (reproducible from the PDF via run_pipeline.py)
+# ── Generated data (reproducible via run_pipeline.py) ─────────────────────
 structrag/data/parsed/
 structrag/data/chunks/
+structrag/data/chroma_db/
 
-# Logs and temp files
+# ── Evaluation artefacts ──────────────────────────────────────────────────
+scoring_progress.json
+
+# ── Logs ──────────────────────────────────────────────────────────────────
 *.log
-*.txt~
-eval_stdout.txt
-eval_stderr.txt
-eval2_stdout.txt
-eval2_stderr.txt
-extractor_out.txt
-extractor_err.txt
-inject_stdout.txt
-inject_stderr.txt
-probe_stdout.txt
-probe_stderr.txt
-run_ext_stdout.txt
-run_ext_stderr.txt
-inspect_stdout.txt
-inspect_stderr.txt
+pipeline_run.log
 
-# LaTeX build artifacts
+# ── LaTeX build artefacts ─────────────────────────────────────────────────
 paper/*.aux
 paper/*.bbl
 paper/*.blg
@@ -47,3 +60,13 @@ paper/*.pdf
 paper/*.synctex.gz
 paper/*.fls
 paper/*.fdb_latexmk
+
+# ── Jupyter ───────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb~
+
+# ── Coverage / test artefacts ─────────────────────────────────────────────
+.coverage
+.pytest_cache/
+htmlcov/
+.tox/

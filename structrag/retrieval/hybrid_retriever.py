@@ -1,31 +1,41 @@
 """
 structrag/retrieval/hybrid_retriever.py
-----------------------------------------
-Fix 3 — Hybrid BM25 + vector retrieval with Reciprocal Rank Fusion.
+-----------------------------------------
+Hybrid BM25 + vector retrieval with Reciprocal Rank Fusion (RRF).
 
-Symbolic queries like "γc = 1.5" or "εcu2 3.5‰" are exact-match problems
-that embeddings handle poorly.  BM25 finds these by term frequency.
-We fuse BM25 and cosine similarity scores with Reciprocal Rank Fusion (RRF)
-and return the merged, re-ranked result list.
+Motivation
+----------
+Embedding models encode semantics well but struggle with exact symbolic
+queries such as "γc = 1.5" or "εcu2 3.5‰" — these are term-matching
+problems, not semantic ones.  BM25 handles them reliably.
 
-Usage
------
-    from structrag.retrieval.hybrid_retriever import retrieve_hybrid
-
-    results = retrieve_hybrid(
-        query="partial safety factor concrete gamma_c",
-        n_results=5,
-        source_id="ec2_2004_nf",
-    )
+Combining both with RRF gives the best of both worlds:
+  - BM25 catches exact symbols, clause numbers, and French technical terms.
+  - Vector search catches semantically equivalent phrasings.
+  - RRF merges the two ranked lists without requiring score normalisation.
 
 RRF formula
 -----------
     score_rrf(d) = 1/(k + rank_vector(d)) + 1/(k + rank_bm25(d))
-    where k=60 (standard constant that dampens rank differences)
+    k = 60  (standard constant that dampens rank-position differences)
+
+Query expansion
+---------------
+Queries containing exposure class codes (XC2, XD3, …) or structural class
+codes (S1-S6) are automatically expanded for BM25 to improve recall on
+Table 4.4N cover lookups.
+
+BM25 index
+----------
+Built lazily on first call from the hierarchical chunks JSON.  French
+stemming (NLTK Snowball) is applied when NLTK is available; falls back to
+simple whitespace tokenisation otherwise.
 """
 
 from __future__ import annotations
+
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -33,99 +43,92 @@ from typing import Optional
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from structrag.retrieval.retriever import retrieve_hierarchical, DEFAULT_N_RESULTS
-from structrag.retrieval.chroma_client import get_collection, COLLECTION_HIERARCHICAL
+from structrag.config import HIER_CHUNKS_PATH, RRF_K
+from structrag.retrieval.retriever import retrieve_hierarchical
 
 # ---------------------------------------------------------------------------
-# BM25 index — built lazily on first call, cached in memory
+# BM25 index — built lazily, cached in module globals
 # ---------------------------------------------------------------------------
 _bm25_index = None
 _bm25_chunks: list[dict] = []
 
-CHUNKS_PATH = (
-    PROJECT_ROOT / "structrag" / "data" / "chunks" / "ec2_hierarchical_chunks.json"
-)
+
+def _tokenise(text: str) -> list[str]:
+    """Tokenise text for BM25; apply French stemming when NLTK is available."""
+    tokens = re.findall(r'[^\s\|\,\;\.\:\!\?\(\)\[\]\{\}]+', text.lower())
+    try:
+        from nltk.stem.snowball import FrenchStemmer
+        stemmer = FrenchStemmer()
+        return [stemmer.stem(t) for t in tokens]
+    except ImportError:
+        return tokens
 
 
-def _build_bm25_index():
-    """Load all chunks and build a BM25 index over their text."""
+def _build_bm25_index() -> None:
+    """Load all hierarchical chunks and build an in-memory BM25 index."""
     global _bm25_index, _bm25_chunks
+
     if _bm25_index is not None:
         return
 
     try:
         from rank_bm25 import BM25Okapi
     except ImportError:
-        raise ImportError(
-            "rank_bm25 not installed. Run: pip install rank-bm25"
+        raise ImportError("rank_bm25 not installed. Run: pip install rank-bm25")
+
+    if not HIER_CHUNKS_PATH.exists():
+        raise FileNotFoundError(
+            f"Hierarchical chunks not found: {HIER_CHUNKS_PATH}\n"
+            "Run run_pipeline.py first to build the index."
         )
 
-    if not CHUNKS_PATH.exists():
-        raise FileNotFoundError(f"Chunks file not found: {CHUNKS_PATH}")
-
-    with open(CHUNKS_PATH, encoding="utf-8") as f:
+    with open(HIER_CHUNKS_PATH, encoding="utf-8") as f:
         _bm25_chunks = json.load(f)
 
-    # Tokenise: lowercase, split on whitespace + punctuation
-    import re
-
-    # French stemmer for better morphological matching
-    # armatures/armature, expositions/exposition, contraintes/contrainte etc.
-    try:
-        from nltk.stem.snowball import FrenchStemmer
-        _stemmer = FrenchStemmer()
-        def tokenise(text: str) -> list[str]:
-            tokens = re.findall(r'[^\s\|\,\;\.\:\!\?\(\)\[\]\{\}]+', text.lower())
-            return [_stemmer.stem(t) for t in tokens]
-    except ImportError:
-        def tokenise(text: str) -> list[str]:
-            return re.findall(r'[^\s\|\,\;\.\:\!\?\(\)\[\]\{\}]+', text.lower())
-
-    corpus = [tokenise(c.get("text", "")) for c in _bm25_chunks]
+    corpus = [_tokenise(c.get("text", "")) for c in _bm25_chunks]
     _bm25_index = BM25Okapi(corpus)
-    print(f"[BM25] Index built: {len(_bm25_chunks)} documents (French stemming)")
+    stemming = "with French stemming" if _nltk_available() else "no stemming (install nltk)"
+    print(f"[BM25] Index built: {len(_bm25_chunks)} documents ({stemming})")
+
+
+def _nltk_available() -> bool:
+    try:
+        from nltk.stem.snowball import FrenchStemmer  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 def _bm25_search(query: str, n: int) -> list[dict]:
-    """Return top-n BM25 results as dicts matching retriever output format."""
-    _build_bm25_index()
-
-    import re
-    # Use same stemmer as the index for consistent matching
-    try:
-        from nltk.stem.snowball import FrenchStemmer
-        _stemmer = FrenchStemmer()
-        raw_tokens = re.findall(r'[^\s\|\,\;\.\:\!\?\(\)\[\]\{\}]+', query.lower())
-        tokens = [_stemmer.stem(t) for t in raw_tokens]
-    except ImportError:
-        tokens = re.findall(r'[^\s\|\,\;\.\:\!\?\(\)\[\]\{\}]+', query.lower())
-    scores = _bm25_index.get_scores(tokens)
-
-    # Get top-n indices by score
+    """Return top-n BM25 results formatted like retriever output."""
     import heapq
+
+    _build_bm25_index()
+    tokens = _tokenise(query)
+    scores = _bm25_index.get_scores(tokens)
     top_indices = heapq.nlargest(n, range(len(scores)), key=lambda i: scores[i])
 
     results = []
     for rank, idx in enumerate(top_indices):
         chunk = _bm25_chunks[idx]
-        meta = {k: v for k, v in chunk.items() if k != "text"}
         entry = {
             "chunk_id":     chunk.get("chunk_id", ""),
             "text":         chunk.get("text", ""),
             "score":        round(float(scores[idx]), 4),
             "bm25_rank":    rank + 1,
-            "metadata":     meta,
+            "metadata":     {k: v for k, v in chunk.items() if k != "text"},
             "retrieval":    "bm25",
         }
-        # Promote hierarchical metadata fields
         if chunk.get("chunk_type") == "hierarchical":
             entry["ancestor_path"] = chunk.get("ancestor_path", "")
             entry["clause_number"] = chunk.get("clause_number", "")
             entry["level"]         = int(chunk.get("level", -1))
             entry["page_number"]   = int(chunk.get("page_number", 0))
             raw_refs = chunk.get("cross_refs", [])
-            entry["cross_refs"] = raw_refs if isinstance(raw_refs, list) else \
-                                   [r for r in raw_refs.split(",") if r]
+            entry["cross_refs"] = (
+                raw_refs if isinstance(raw_refs, list)
+                else [r for r in raw_refs.split(",") if r]
+            )
         results.append(entry)
 
     return results
@@ -135,51 +138,39 @@ def _bm25_search(query: str, n: int) -> list[dict]:
 # Reciprocal Rank Fusion
 # ---------------------------------------------------------------------------
 
-RRF_K = 60   # standard constant
-
-
 def _rrf_fuse(
     vector_results: list[dict],
-    bm25_results:   list[dict],
-    n_results:      int,
+    bm25_results: list[dict],
+    n_results: int,
 ) -> list[dict]:
-    """
-    Merge two ranked lists with Reciprocal Rank Fusion.
-    Returns the top-n_results items, each annotated with its RRF score
-    and which retrievers found it.
-    """
-    # Build chunk_id -> result map
-    all_chunks: dict[str, dict] = {}
+    """Merge two ranked lists using RRF and return the top n_results items."""
+    merged: dict[str, dict] = {}
 
     for rank, r in enumerate(vector_results, 1):
         cid = r["chunk_id"]
-        if cid not in all_chunks:
-            all_chunks[cid] = dict(r)
-            all_chunks[cid]["rrf_score"] = 0.0
-            all_chunks[cid]["found_by"] = []
-        all_chunks[cid]["rrf_score"] += 1.0 / (RRF_K + rank)
-        all_chunks[cid]["found_by"].append("vector")
-        all_chunks[cid]["vector_rank"] = rank
-        all_chunks[cid]["vector_score"] = r.get("score", 0)
+        if cid not in merged:
+            merged[cid] = dict(r)
+            merged[cid]["rrf_score"] = 0.0
+            merged[cid]["found_by"] = []
+        merged[cid]["rrf_score"] += 1.0 / (RRF_K + rank)
+        merged[cid]["found_by"].append("vector")
+        merged[cid]["vector_rank"] = rank
 
     for rank, r in enumerate(bm25_results, 1):
         cid = r["chunk_id"]
-        if cid not in all_chunks:
-            all_chunks[cid] = dict(r)
-            all_chunks[cid]["rrf_score"] = 0.0
-            all_chunks[cid]["found_by"] = []
-        all_chunks[cid]["rrf_score"] += 1.0 / (RRF_K + rank)
-        all_chunks[cid]["found_by"].append("bm25")
-        all_chunks[cid]["bm25_rank"] = rank
-        all_chunks[cid]["bm25_score"] = r.get("score", 0)
+        if cid not in merged:
+            merged[cid] = dict(r)
+            merged[cid]["rrf_score"] = 0.0
+            merged[cid]["found_by"] = []
+        merged[cid]["rrf_score"] += 1.0 / (RRF_K + rank)
+        merged[cid]["found_by"].append("bm25")
+        merged[cid]["bm25_rank"] = rank
 
-    # Sort by RRF score descending
-    ranked = sorted(all_chunks.values(), key=lambda x: x["rrf_score"], reverse=True)
+    ranked = sorted(merged.values(), key=lambda x: x["rrf_score"], reverse=True)
 
-    # Clean up: set unified score = rrf_score, keep top n
     for item in ranked:
         item["score"] = round(item["rrf_score"], 6)
-    
+
     return ranked[:n_results]
 
 
@@ -189,7 +180,7 @@ def _rrf_fuse(
 
 def retrieve_hybrid(
     query: str,
-    n_results: int = 8,          # k=8 as per Fix 4
+    n_results: int = 8,
     source_id: Optional[str] = None,
     level: Optional[int] = None,
     clause_number: Optional[str] = None,
@@ -197,16 +188,18 @@ def retrieve_hybrid(
     """
     Hybrid BM25 + vector retrieval with RRF re-ranking.
 
-    Automatically expands queries containing exposure class (XC1-XA3) or
-    structural class (S1-S6) references to improve BM25 recall on cover
-    table lookups (Tableau 4.4N).
+    Parameters
+    ----------
+    query         : user question or keyword string
+    n_results     : number of final results to return
+    source_id     : filter to one document (e.g. "ec2_2004_nf")
+    level         : filter to one heading level
+    clause_number : exact clause lookup
     """
-    import re as _re
-
-    # Query expansion for table lookups: detect class identifiers
-    exposure_classes = _re.findall(r'\b(X[CDSFA][0-9])\b', query, _re.IGNORECASE)
-    structural_classes = _re.findall(r'\b(S[1-6])\b', query, _re.IGNORECASE)
-    concrete_classes = _re.findall(r'\b(C\d{2}/\d{2})\b', query, _re.IGNORECASE)
+    # Expand query for table-lookup queries containing class identifiers
+    exposure_classes  = re.findall(r'\b(X[CDSFA][0-9])\b', query, re.IGNORECASE)
+    structural_classes = re.findall(r'\b(S[1-6])\b', query, re.IGNORECASE)
+    concrete_classes  = re.findall(r'\b(C\d{2}/\d{2})\b', query, re.IGNORECASE)
 
     if exposure_classes or structural_classes or concrete_classes:
         extras = " ".join(exposure_classes + structural_classes + concrete_classes)
@@ -214,10 +207,8 @@ def retrieve_hybrid(
     else:
         bm25_query = query
 
-    # Fetch more candidates before re-ranking
     k_fetch = max(n_results * 2, 10)
 
-    # Vector retrieval (uses original query for semantic matching)
     vector_results = retrieve_hierarchical(
         query=query,
         n_results=k_fetch,
@@ -226,22 +217,20 @@ def retrieve_hybrid(
         clause_number=clause_number,
     )
 
-    # BM25 retrieval (uses expanded query for keyword matching)
     try:
         bm25_results = _bm25_search(bm25_query, k_fetch)
-    except ImportError:
+    except (ImportError, FileNotFoundError) as exc:
+        print(f"[BM25] Warning: {exc} — falling back to vector-only")
         return vector_results[:n_results]
-    except Exception as e:
-        print(f"[BM25] Warning: {e} — falling back to vector only")
+    except Exception as exc:
+        print(f"[BM25] Warning: {exc} — falling back to vector-only")
         return vector_results[:n_results]
 
-    # Fuse
-    fused = _rrf_fuse(vector_results, bm25_results, n_results)
-    return fused
+    return _rrf_fuse(vector_results, bm25_results, n_results)
 
 
 # ---------------------------------------------------------------------------
-# Quick smoke test
+# Smoke test
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -260,7 +249,6 @@ if __name__ == "__main__":
         print(f"\nQuery: {q}")
         results = retrieve_hybrid(q, n_results=3, source_id="ec2_2004_nf")
         for i, r in enumerate(results, 1):
-            found_by = r.get("found_by", ["?"])
-            print(f"  [{i}] rrf={r['score']:.4f}  by={found_by}  "
-                  f"clause={r.get('clause_number','')}  "
-                  f"path={r.get('ancestor_path','')[:60]}")
+            print(f"  [{i}] rrf={r['score']:.4f}  by={r.get('found_by', ['?'])}  "
+                  f"clause={r.get('clause_number', '')}  "
+                  f"path={r.get('ancestor_path', '')[:60]}")

@@ -1,35 +1,40 @@
 """
-flat_chunker.py
----------------
-Phase 6 — Flat-Chunking Baseline
+structrag/chunking/flat_chunker.py
+------------------------------------
+Flat sliding-window baseline chunker.
 
-Naive fixed-size sliding-window chunking — the BASELINE that the hierarchical
-pipeline is compared against.  Uses the same corpus, same embedding model, and
-same token budget.  The only difference is: no hierarchy awareness, no
-ancestor_path, no clause boundaries respected.
+This is the BASELINE that the hierarchical pipeline is compared against.
+It uses the same corpus, the same embedding model, and the same token
+budget.  The only difference is: no hierarchy awareness, no ancestor_path,
+and no clause boundaries are respected.
 
 How it works
 ------------
-1.  Read the raw PDF text page-by-page with PyMuPDF.
-2.  Strip page headers/footers, concatenate all content pages.
-3.  Tokenise the full text, slide a window of MAX_TOKENS with OVERLAP_TOKENS.
-4.  Each window becomes one chunk — it will routinely span clause boundaries.
+1. Read raw PDF text page-by-page with PyMuPDF.
+2. Strip page headers/footers; concatenate all content pages.
+3. Tokenise the full concatenated text.
+4. Slide a window of MAX_TOKENS with OVERLAP_TOKENS stride.
+5. Each window becomes one chunk — it will routinely span clause boundaries.
+
+This deliberate structure-blindness is what makes it a valid baseline:
+any measured difference in answer quality vs the hierarchical pipeline is
+attributable solely to the chunking strategy.
 
 Output
 ------
-structrag/data/chunks/ec2_flat_chunks.json
 Each chunk dict:
-    chunk_id     str
-    source_id    str
-    chunk_type   "flat"
-    text         str
-    token_count  int
-    start_page   int
-    end_page     int
-    part_index   int
+    chunk_id    str   — unique identifier
+    source_id   str   — document identifier
+    chunk_type  str   — "flat"
+    text        str   — raw window text
+    token_count int
+    start_page  int   — 1-indexed page of first token in window
+    end_page    int   — 1-indexed page of last token in window
+    part_index  int   — sequential window index
 """
 
 from __future__ import annotations
+
 import json
 import re
 import sys
@@ -38,15 +43,23 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-# ---------------------------------------------------------------------------
-# Configuration — identical to hierarchical chunker for fair comparison
-# ---------------------------------------------------------------------------
-MAX_TOKENS     = 512
-OVERLAP_TOKENS = 64
-SKIP_PAGES_BEFORE = 17  # cover + TOC pages (0-indexed)
+from structrag.config import (
+    FLAT_CHUNKS_PATH,
+    FLAT_MAX_TOKENS,
+    FLAT_OVERLAP_TOKENS,
+    FLAT_SKIP_PAGES,
+)
+
+MAX_TOKENS     = FLAT_MAX_TOKENS
+OVERLAP_TOKENS = FLAT_OVERLAP_TOKENS
+SKIP_PAGES     = FLAT_SKIP_PAGES
+
+# Page header pattern for the EC2 NF edition
+_HEADER_RE    = re.compile(r'^Page\s+\d+')
+_STANDARD_REF = "EN 1992-1-1:2004"
 
 # ---------------------------------------------------------------------------
-# Token counting — same fallback logic as hierarchical_chunker.py
+# Token counting with tiktoken fallback
 # ---------------------------------------------------------------------------
 try:
     import tiktoken
@@ -61,52 +74,49 @@ try:
     def _decode(token_ids: list) -> str:
         return _enc.decode(token_ids)
 
-    TIKTOKEN_AVAILABLE = True
+    _TIKTOKEN = True
 
 except ImportError:
-    TIKTOKEN_AVAILABLE = False
+    _TIKTOKEN = False
 
-    def count_tokens(text: str) -> int:       # type: ignore[misc]
+    def count_tokens(text: str) -> int:  # type: ignore[misc]
         return int(len(text) / 4)
 
-    def _encode(text: str) -> list:           # type: ignore[misc]
-        # Treat whitespace-separated words as tokens
+    def _encode(text: str) -> list:  # type: ignore[misc]
         return text.split()
 
-    def _decode(token_ids: list) -> str:      # type: ignore[misc]
+    def _decode(token_ids: list) -> str:  # type: ignore[misc]
         if token_ids and isinstance(token_ids[0], str):
             return " ".join(token_ids)
-        raise NotImplementedError("tiktoken not available; cannot decode token IDs")
+        raise NotImplementedError("tiktoken unavailable — cannot decode token IDs")
 
 
 # ---------------------------------------------------------------------------
-# Extract text from PDF, stripping headers/footers
+# PDF text extraction
 # ---------------------------------------------------------------------------
 
-# Pattern for the EC2 page header: "Page 14" or "EN 1992-1-1:2004"
-_HEADER_RE = re.compile(r'^Page\s+\d+$')
-_STANDARD_REF = "EN 1992-1-1:2004"
-
-
-def _extract_pages(pdf_path: str, skip_before: int) -> list[tuple[int, str]]:
+def _extract_pages(pdf_path: str, skip_before: int = SKIP_PAGES) -> list[tuple[int, str]]:
     """
     Return [(page_number_1indexed, cleaned_text), ...] for all content pages.
+
+    Strips the EC2 running header/footer ("Page N" and standard reference line)
+    and collapses internal whitespace.
     """
     import fitz  # PyMuPDF
+
     doc = fitz.open(pdf_path)
     pages = []
     for i in range(skip_before, len(doc)):
         raw = doc[i].get_text("text")
-        lines = raw.splitlines()
-        clean_lines = [
-            ln for ln in lines
+        lines = [
+            ln for ln in raw.splitlines()
             if not _HEADER_RE.match(ln.strip())
             and ln.strip() != _STANDARD_REF
             and ln.strip()
         ]
-        clean_text = re.sub(r'\s+', ' ', " ".join(clean_lines)).strip()
+        clean_text = re.sub(r'\s+', ' ', " ".join(lines)).strip()
         if clean_text:
-            pages.append((i + 1, clean_text))   # 1-indexed
+            pages.append((i + 1, clean_text))   # 1-indexed page number
     return pages
 
 
@@ -122,10 +132,12 @@ def _sliding_window_chunks(
 ) -> list[dict]:
     """
     Concatenate all pages into one token stream and slide a fixed window.
-    The page-boundary table lets us report start_page / end_page per chunk
-    even though the chunker itself is completely unaware of page structure.
+
+    A sparse page-boundary table maps token positions back to 1-indexed page
+    numbers so each chunk records start_page / end_page even though the
+    chunker itself is entirely unaware of page structure.
     """
-    # ---- build concatenated text and record char offset of each page ----
+    # Build concatenated text and record char offset of each page start
     combined_parts: list[str] = []
     page_char_offsets: list[tuple[int, int]] = []   # (char_start, page_num)
     cursor = 0
@@ -135,19 +147,18 @@ def _sliding_window_chunks(
         cursor += len(text) + 1   # +1 for the space separator
     combined_text = " ".join(combined_parts)
 
-    # ---- tokenise -------------------------------------------------------
+    # Build sparse (token_index, page_num) map at page boundaries
     all_tokens = _encode(combined_text)
+    page_token_starts: list[tuple[int, int]] = []
 
-    # Build a sparse map: every N tokens → page number
-    # We compute it by encoding prefixes at page boundaries
-    page_token_starts: list[tuple[int, int]] = []  # (token_idx, page_num)
-    if TIKTOKEN_AVAILABLE:
+    if _TIKTOKEN:
+        import tiktoken as _tiktoken
+        _local_enc = _tiktoken.get_encoding("cl100k_base")
         for char_start, page_num in page_char_offsets:
-            tok_idx = len(_enc.encode(combined_text[:char_start]))
+            tok_idx = len(_local_enc.encode(combined_text[:char_start]))
             page_token_starts.append((tok_idx, page_num))
     else:
         for char_start, page_num in page_char_offsets:
-            # word-based: count words before this offset
             tok_idx = len(combined_text[:char_start].split())
             page_token_starts.append((tok_idx, page_num))
 
@@ -160,7 +171,7 @@ def _sliding_window_chunks(
                 break
         return page
 
-    # ---- slide window ---------------------------------------------------
+    # Slide the window
     chunks: list[dict] = []
     step = max_tokens - overlap
     start = 0
@@ -174,15 +185,14 @@ def _sliding_window_chunks(
         end_page   = _page_for_token(end - 1)
 
         chunks.append({
-            "chunk_id":   f"{source_id}_flat_{part_index}",
-            "source_id":  source_id,
-            "chunk_type": "flat",
-            "text":       text,
+            "chunk_id":    f"{source_id}_flat_{part_index}",
+            "source_id":   source_id,
+            "chunk_type":  "flat",
+            "text":        text,
             "token_count": len(window),
-            "start_page": start_page,
-            "end_page":   end_page,
-            "part_index": part_index,
-            # Deliberately no ancestor_path or clause_number — that is the point
+            "start_page":  start_page,
+            "end_page":    end_page,
+            "part_index":  part_index,
         })
 
         part_index += 1
@@ -194,7 +204,7 @@ def _sliding_window_chunks(
 
 
 # ---------------------------------------------------------------------------
-# Save / load
+# Save / load helpers
 # ---------------------------------------------------------------------------
 
 def save_chunks(chunks: list[dict], path: str) -> None:
@@ -213,14 +223,18 @@ def load_chunks(path: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    base = Path(r"C:\Users\manef\OneDrive\Desktop\stageesprit")
-    pdf_path   = base / "FA039724-NF EN 1992-1-1 (octobre 2005) Eurocode 2.pdf"
-    output_dir = base / "structrag" / "data" / "chunks"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / "ec2_flat_chunks.json"
+    import sys
 
-    print(f"Extracting text from {pdf_path.name} ...")
-    pages = _extract_pages(str(pdf_path), SKIP_PAGES_BEFORE)
+    # Resolve PDF path: look in project root
+    pdf_candidates = list(PROJECT_ROOT.glob("*.pdf"))
+    if not pdf_candidates:
+        print("ERROR: No PDF found in project root. Place the EC2 PDF there and retry.")
+        sys.exit(1)
+    pdf_path = pdf_candidates[0]
+    print(f"Using PDF: {pdf_path.name}")
+
+    print(f"Extracting text (skipping first {SKIP_PAGES} pages) ...")
+    pages = _extract_pages(str(pdf_path), SKIP_PAGES)
     print(f"Content pages: {len(pages)}")
 
     print(f"Building flat chunks (window={MAX_TOKENS}, overlap={OVERLAP_TOKENS}) ...")
@@ -232,11 +246,9 @@ if __name__ == "__main__":
           f"avg:{sum(token_counts)//len(token_counts)}  "
           f"max:{max(token_counts)}")
 
-    print("\n--- Sample flat chunks ---")
     for c in chunks[:3]:
-        print(f"  id={c['chunk_id']}  pages={c['start_page']}-{c['end_page']}  "
+        print(f"\n  id={c['chunk_id']}  pages={c['start_page']}-{c['end_page']}  "
               f"tokens={c['token_count']}")
         print(f"  text: {c['text'][:200]}")
-        print()
 
-    save_chunks(chunks, str(output_path))
+    save_chunks(chunks, str(FLAT_CHUNKS_PATH))

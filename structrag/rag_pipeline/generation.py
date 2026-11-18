@@ -33,6 +33,7 @@ Returns a GenerationResult dataclass containing:
 """
 
 from __future__ import annotations
+
 import os
 import sys
 from dataclasses import dataclass, field
@@ -42,12 +43,12 @@ from typing import Optional
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from structrag.config import DEFAULT_MAX_TOKENS, DEFAULT_TEMPERATURE  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 DEFAULT_MODEL    = "gpt-4o-mini"
-DEFAULT_MAX_TOKENS = 1024
-DEFAULT_TEMPERATURE = 0.0     # deterministic — important for reproducibility
 
 SYSTEM_PROMPT = """You are a structural engineering assistant specializing in \
 Eurocode 2 (EN 1992-1-1).

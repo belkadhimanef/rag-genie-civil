@@ -73,6 +73,15 @@ try:
 except ImportError:
     pass  # dotenv optional — keys can still be set manually in the shell
 
+from structrag.config import (  # noqa: E402
+    DEFAULT_GROQ_MODEL,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_N_RESULTS,
+    RERANK_TOP_N,
+    RELEVANCE_THRESHOLD,
+    EC2_SOURCE_ID,
+)
 from structrag.rag_pipeline.generation import (
     GenerationResult,
     build_prompt,
@@ -83,15 +92,8 @@ from structrag.retrieval.hybrid_retriever import retrieve_hybrid
 # ---------------------------------------------------------------------------
 # Configuration — read from environment, never hardcoded
 # ---------------------------------------------------------------------------
-DEFAULT_MODEL       = "openai/gpt-oss-120b"
-DEFAULT_MAX_TOKENS  = 1024
-DEFAULT_TEMPERATURE = 0.0   # deterministic for reproducibility / RAGAS scoring
-DEFAULT_N_RESULTS   = 8     # Fix 4: raised from 5 to 8
-
-# Score threshold: cosine distance (lower = more similar).
-# Chunks with distance > this are considered low-relevance.
-# ChromaDB returns distances in [0, 2] for cosine; 0 = identical, 2 = opposite.
-RELEVANCE_THRESHOLD = 1.2   # generous — keep anything remotely related
+DEFAULT_MODEL       = DEFAULT_GROQ_MODEL
+DEFAULT_N_RESULTS   = DEFAULT_N_RESULTS
 
 # ---------------------------------------------------------------------------
 # Domain classifier — Layer 1: keyword scan

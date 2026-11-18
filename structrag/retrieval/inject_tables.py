@@ -21,12 +21,12 @@ sys.path.insert(0, str(PROJECT_ROOT))
 if hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
-BASE       = PROJECT_ROOT
-PDF_PATH   = BASE / "FA039724-NF EN 1992-1-1 (octobre 2005) Eurocode 2.pdf"
-CHUNKS_PATH = BASE / "structrag" / "data" / "chunks" / "ec2_hierarchical_chunks.json"
-
+from structrag.config import HIER_CHUNKS_PATH, PROJECT_ROOT
 from structrag.parsing.table_extractor import extract_tables
 from structrag.retrieval.chroma_client import get_collection, COLLECTION_HIERARCHICAL
+
+BASE       = PROJECT_ROOT
+PDF_PATH   = next(iter(BASE.glob("*.pdf")), None)
 
 
 def node_to_chunk(node) -> dict:
@@ -67,13 +67,17 @@ def meta_for_chroma(chunk: dict) -> dict:
 
 
 def inject_tables():
-    print(f"Extracting tables from PDF...")
+    if PDF_PATH is None:
+        print("ERROR: No PDF found in project root. Place the EC2 PDF there first.")
+        return
+
+    print(f"Extracting tables from PDF ...")
     nodes = extract_tables(str(PDF_PATH))
     print(f"Extracted {len(nodes)} table nodes")
 
     # ── 1. Update chunks JSON ─────────────────────────────────────────────
-    print(f"\nLoading existing chunks from {CHUNKS_PATH.name}...")
-    with open(CHUNKS_PATH, encoding="utf-8") as f:
+    print(f"\nLoading existing chunks from {HIER_CHUNKS_PATH.name}...")
+    with open(HIER_CHUNKS_PATH, encoding="utf-8") as f:
         existing_chunks = json.load(f)
 
     existing_ids = {c["chunk_id"] for c in existing_chunks}
@@ -87,7 +91,7 @@ def inject_tables():
     # Append all table chunks
     existing_chunks.extend(new_chunks)
 
-    with open(CHUNKS_PATH, "w", encoding="utf-8") as f:
+    with open(HIER_CHUNKS_PATH, "w", encoding="utf-8") as f:
         json.dump(existing_chunks, f, ensure_ascii=False, indent=2)
     print(f"Chunks JSON updated: +{len(added)} new, {len(updated)} updated -> {len(existing_chunks)} total")
 
